@@ -48,8 +48,8 @@ class MirrorActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        hideSystemUi()
         buildUi()
+        hideSystemUi()
         attachToService()
         ContextCompat.startForegroundService(this, Intent(this, AirPlayService::class.java))
         syncState(intent)
