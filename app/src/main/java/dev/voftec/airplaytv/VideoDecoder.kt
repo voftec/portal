@@ -249,8 +249,8 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
     private fun restartCodec(firstAu: ByteArray) {
         lock.withLock {
             restartOnNextIdr = false
-            queue.remove(firstAu)
-            queue.addFirst(firstAu)
+            queue.clear()
+            queue.add(firstAu)
         }
         val surf = lock.withLock { viewSurface } ?: ensurePlaceholder()
         var vw = if (reportedWidth > 0) reportedWidth else 1920
