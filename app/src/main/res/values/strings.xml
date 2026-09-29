@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pantalla AirPlay</string>
+    <string name="idle_title">Listo para recibir</string>
+    <string name="idle_instructions">En tu Mac: Centro de control → Duplicar pantalla → «%1$s»</string>
+    <string name="status_running">Receptor AirPlay activo</string>
+    <string name="status_stopped">Receptor detenido</string>
+    <string name="status_starting">Iniciando receptor…</string>
+    <string name="rename_button">Cambiar nombre del televisor</string>
+    <string name="rename_title">Nombre del televisor</string>
+    <string name="rename_hint">Ej.: TV del cuarto</string>
+    <string name="rename_ok">Aceptar</string>
+    <string name="rename_cancel">Cancelar</string>
+    <string name="ip_label">IP: %1$s</string>
+    <string name="notification_title">Receptor AirPlay</string>
+    <string name="notification_text">«%1$s» visible para duplicar la pantalla</string>
+    <string name="notification_channel">Estado del receptor</string>
+    <string name="mirroring">Recibiendo duplicación de pantalla</string>
+</resources>

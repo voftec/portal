@@ -1,0 +1,18 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+*.iml
+.idea/
+.cxx/
+app/.cxx/
+
+# Native dep artifacts (rebuilt by native/fetch-and-build-deps.sh)
+native/dl/
+native/deps/
+native/prebuilt/
+
+# keystores
+*.keystore
+*.jks

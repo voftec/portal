@@ -1,0 +1,30 @@
+name: Android CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK + CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
+      - name: Fetch and build native deps
+        run: bash native/fetch-and-build-deps.sh
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+      - name: Build APK
+        run: ./gradlew assembleDebug lint
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
