@@ -40,7 +40,10 @@ class MirrorActivity : Activity() {
             when (intent.action) {
                 AirPlayService.ACTION_MIRROR_START -> showMirror()
                 AirPlayService.ACTION_MIRROR_STOP -> showIdle()
-                AirPlayService.ACTION_STATUS -> refreshStatus()
+                AirPlayService.ACTION_STATUS -> {
+                    attachToService()
+                    refreshStatus()
+                }
             }
         }
     }
@@ -61,6 +64,9 @@ class MirrorActivity : Activity() {
     private fun attachToService() {
         val svc = AirPlayService.instance ?: return
         svc.aspectListener = { w, h -> runOnUiThread { onVideoSize(w, h) } }
+        if (::surfaceView.isInitialized && surfaceView.holder.surface.isValid) {
+            svc.videoDecoder?.setSurface(surfaceView.holder.surface)
+        }
     }
 
     private fun syncState(intent: Intent?) {

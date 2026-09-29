@@ -1,5 +1,6 @@
 package dev.voftec.airplaytv
 
+import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
@@ -19,36 +20,42 @@ import kotlin.concurrent.withLock
  * drains the queue, onOutputBufferAvailable renders immediately — including
  * when the Mac desktop is static and no new input arrives.
  *
+ * The codec survives surface changes: it is created on the first IDR AU and
+ * configured onto a detached SurfaceTexture placeholder until the SurfaceView
+ * surface exists. setSurface() swaps the output surface in place; the codec
+ * is only recreated on SPS-size change, stream reset or setOutputSurface
+ * failure. macOS only sends an IDR at stream start, so stopping the codec on
+ * surface loss would leave a new codec waiting forever for one.
+ *
  * If the queue exceeds MAX_QUEUED_AUS, everything before the latest IDR is
- * dropped to bound latency. Before the surface exists, AUs are buffered from
- * the latest IDR onward (cap PENDING_CAP) and flushed once the codec is up —
- * macOS doesn't resend IDRs often, so the first seconds would otherwise be lost.
+ * dropped to bound latency.
  */
 class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
 
     companion object {
         private const val TAG = "AirPlayTV.Video"
-        private const val PENDING_CAP = 16 * 1024 * 1024
         private const val MAX_QUEUED_AUS = 30
     }
 
     private val lock = ReentrantLock()
 
     private var codec: MediaCodec? = null
-    private var surface: Surface? = null
+    private var viewSurface: Surface? = null
     private var configuredWidth = 0
     private var configuredHeight = 0
+    private var restartOnNextIdr = false
+    private var firstFrameLogged = false
 
     private var codecThread: HandlerThread? = null
     private var codecHandler: Handler? = null
 
+    // Detached-mode placeholder: consumes output while no view surface exists.
+    private var placeholderTexture: SurfaceTexture? = null
+    private var placeholder: Surface? = null
+
     // AUs queued for an idle input buffer (codec running, no free slot yet).
     private val queue = ArrayDeque<ByteArray>()
     private val freeInputs = ArrayDeque<Int>()  // free input slots while queue empty
-
-    // AUs captured before the surface/codec exists.
-    private val pending = ArrayList<ByteArray>()
-    private var pendingBytes = 0
 
     @Volatile var reportedWidth = 0
     @Volatile var reportedHeight = 0
@@ -69,10 +76,16 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         override fun onOutputBufferAvailable(c: MediaCodec, index: Int,
                                              info: MediaCodec.BufferInfo) {
             if (!isCurrent(c)) return
-            val render = info.size > 0 &&
+            // Nothing is queued to the placeholder — it has no consumer.
+            val render = lock.withLock { viewSurface != null } &&
+                info.size > 0 &&
                 (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
             try {
                 c.releaseOutputBuffer(index, render)
+                if (render && !firstFrameLogged) {
+                    firstFrameLogged = true
+                    Log.i(TAG, "first frame rendered")
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "releaseOutputBuffer: $e")
             }
@@ -96,15 +109,31 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
     }
 
     fun setSurface(s: Surface?) {
+        val c: MediaCodec?
         lock.withLock {
-            surface = s
+            viewSurface = s
+            c = codec
         }
-        if (s == null) {
-            stopCodec()
-        } else {
-            startCodecIfNeeded(null)
-            drainPending()
+        val target = s ?: ensurePlaceholder()
+        if (c != null) {
+            try {
+                c.setOutputSurface(target)
+                Log.i(TAG, "output surface -> ${if (s != null) "view" else "placeholder"}")
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "setOutputSurface: $e")
+                markRestart()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "setOutputSurface: $e")
+                markRestart()
+            }
         }
+    }
+
+    private fun markRestart() {
+        // setOutputSurface failed: stop the codec; the next IDR recreates it
+        // on the new surface.
+        stopCodec()
+        lock.withLock { restartOnNextIdr = true }
     }
 
     fun onReportedSize(width: Int, height: Int) {
@@ -119,47 +148,60 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
 
         val hasIdr = findIdr(bytes) >= 0
         lock.withLock {
-            if (surface == null || codec == null) {
-                // pre-surface: buffer from latest IDR onward, bounded
-                if (hasIdr) {
-                    pending.clear()
-                    pendingBytes = 0
-                    pending.add(bytes)
-                    pendingBytes = bytes.size
-                } else if (pendingBytes + bytes.size <= PENDING_CAP &&
-                           (pending.isNotEmpty() || bytes.size > 0)) {
-                    pending.add(bytes)
-                    pendingBytes += bytes.size
-                }
-                return
-            }
+            if (codec == null && !hasIdr) return  // drop until the first IDR
+            if (restartOnNextIdr && !hasIdr) return
             queue.add(bytes)
             while (queue.size > MAX_QUEUED_AUS) {
                 dropBeforeLatestIdr()
             }
         }
+        if (hasIdr && (lock.withLock { codec == null || restartOnNextIdr } ||
+                       spsSizeDiffers(bytes))) {
+            restartCodec(bytes)
+        }
         offerToCodec()
+    }
+
+    private fun spsSizeDiffers(au: ByteArray): Boolean {
+        val sps = extractSps(au) ?: return false
+        val size = SpsParser.parseSize(sps) ?: return false
+        return lock.withLock {
+            codec != null &&
+                (size.first != configuredWidth || size.second != configuredHeight)
+        }
     }
 
     fun reset() {
         stopCodec()
         lock.withLock {
             queue.clear()
-            pending.clear()
-            pendingBytes = 0
             freeInputs.clear()
+            restartOnNextIdr = true
         }
-        if (surface != null) startCodecIfNeeded(null)
     }
 
     fun release() {
         stopCodec()
         lock.withLock {
             queue.clear()
-            pending.clear()
-            pendingBytes = 0
-            surface = null
+            viewSurface = null
             freeInputs.clear()
+        }
+        lock.withLock {
+            placeholder?.release()
+            placeholder = null
+            placeholderTexture?.release()
+            placeholderTexture = null
+        }
+    }
+
+    private fun ensurePlaceholder(): Surface {
+        lock.withLock {
+            if (placeholder == null) {
+                placeholderTexture = SurfaceTexture(false)
+                placeholder = Surface(placeholderTexture)
+            }
+            return placeholder!!
         }
     }
 
@@ -204,30 +246,22 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         else queue.poll()
     }
 
-    private fun drainPending() {
-        val toSend: List<ByteArray>
+    private fun restartCodec(firstAu: ByteArray) {
         lock.withLock {
-            toSend = ArrayList(pending)
-            pending.clear()
-            pendingBytes = 0
+            restartOnNextIdr = false
+            queue.remove(firstAu)
+            queue.addFirst(firstAu)
         }
-        lock.withLock { queue.addAll(toSend) }
-        offerToCodec()
-    }
-
-    private fun startCodecIfNeeded(firstAu: ByteArray?) {
-        val surf = lock.withLock { surface } ?: return
-        val w = if (reportedWidth > 0) reportedWidth else 1920
-        val h = if (reportedHeight > 0) reportedHeight else 1080
-        var vw = w; var vh = h
-        val probe = firstAu ?: lock.withLock { pending.firstOrNull() ?: queue.peek() }
-        if (probe != null) {
-            extractSps(probe)?.let { SpsParser.parseSize(it) }?.let {
-                vw = it.first; vh = it.second
+        val surf = lock.withLock { viewSurface } ?: ensurePlaceholder()
+        var vw = if (reportedWidth > 0) reportedWidth else 1920
+        var vh = if (reportedHeight > 0) reportedHeight else 1080
+        extractSps(firstAu)?.let { SpsParser.parseSize(it) }?.let {
+            vw = it.first; vh = it.second
+        }
+        lock.withLock {
+            if (codec != null && vw == configuredWidth && vh == configuredHeight) {
+                return  // already configured at this size
             }
-        }
-        lock.withLock {
-            if (codec != null && vw == configuredWidth && vh == configuredHeight) return
         }
         stopCodec()
 
@@ -248,8 +282,10 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
                 codec = c
                 configuredWidth = vw
                 configuredHeight = vh
+                firstFrameLogged = false
             }
-            Log.i(TAG, "decoder configured ${vw}x$vh low-latency (async)")
+            Log.i(TAG, "decoder configured ${vw}x$vh " +
+                "surface=${if (surf === placeholder) "placeholder" else "view"}")
             onAspectRatio(vw, vh)
         } catch (e: Exception) {
             Log.e(TAG, "decoder configure failed: $e")
