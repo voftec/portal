@@ -15,8 +15,9 @@ jobs:
           java-version: '17'
       - name: Install NDK + CMake
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+          SDKMANAGER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;27.0.12077973" "cmake;3.22.1"
       - name: Fetch and build native deps
         run: bash native/fetch-and-build-deps.sh
         env:
