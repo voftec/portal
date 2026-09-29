@@ -44,7 +44,7 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
 
     // AUs queued for an idle input buffer (codec running, no free slot yet).
     private val queue = ArrayDeque<ByteArray>()
-    @Volatile private var freeInput = -1   // free input index while queue empty
+    private val freeInputs = ArrayDeque<Int>()  // free input slots while queue empty
 
     // AUs captured before the surface/codec exists.
     private val pending = ArrayList<ByteArray>()
@@ -54,19 +54,21 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
     @Volatile var reportedHeight = 0
 
     private val codecCallback = object : MediaCodec.Callback() {
+        private fun isCurrent(c: MediaCodec): Boolean = lock.withLock { c === codec }
+
         override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
+            if (!isCurrent(c)) return
             val au = lock.withLock { if (queue.isNotEmpty()) queue.poll() else null }
             if (au != null) {
                 submit(c, index, au)
-                // one buffer used; more may be queued — they arrive via further
-                // onInputBufferAvailable calls
             } else {
-                lock.withLock { freeInput = index }
+                lock.withLock { freeInputs.add(index) }
             }
         }
 
         override fun onOutputBufferAvailable(c: MediaCodec, index: Int,
                                              info: MediaCodec.BufferInfo) {
+            if (!isCurrent(c)) return
             val render = info.size > 0 &&
                 (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
             try {
@@ -77,10 +79,12 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         }
 
         override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+            if (!isCurrent(c)) return
             Log.e(TAG, "codec error: ${e.diagnosticInfo}")
         }
 
         override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {
+            if (!isCurrent(c)) return
             val w = format.getInteger(MediaFormat.KEY_WIDTH)
             val h = format.getInteger(MediaFormat.KEY_HEIGHT)
             lock.withLock {
@@ -143,7 +147,7 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
             queue.clear()
             pending.clear()
             pendingBytes = 0
-            freeInput = -1
+            freeInputs.clear()
         }
         if (surface != null) startCodecIfNeeded(null)
     }
@@ -155,7 +159,7 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
             pending.clear()
             pendingBytes = 0
             surface = null
-            freeInput = -1
+            freeInputs.clear()
         }
     }
 
@@ -174,18 +178,15 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         }
     }
 
-    /** If a free input slot is remembered, push the head of the queue into it. */
+    /** Pair free input slots with queued AUs, on the codec handler thread. */
     private fun offerToCodec() {
         val c = lock.withLock { codec } ?: return
-        lock.withLock {
-            if (freeInput < 0 || queue.isEmpty()) return
-        }
-        codecHandler?.post {
+        val handler = codecHandler ?: return
+        handler.post {
             lock.withLock {
-                val idx = freeInput
-                if (idx >= 0 && queue.isNotEmpty()) {
-                    freeInput = -1
-                    submit(c, idx, queue.poll()!!)
+                if (codec !== c) return@withLock
+                while (freeInputs.isNotEmpty() && queue.isNotEmpty()) {
+                    submit(c, freeInputs.poll()!!, queue.poll()!!)
                 }
             }
         }
@@ -264,7 +265,7 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
             codec = null
             configuredWidth = 0
             configuredHeight = 0
-            freeInput = -1
+            freeInputs.clear()
         }
         codecHandler?.post {
             try { c.stop(); c.release() } catch (e: Exception) {
