@@ -35,9 +35,15 @@ class AirPlayService : Service(), AirPlayNative.Listener {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var mirroring = false
 
-    // Owned by MirrorActivity via the binder-free singleton hand-off.
+    @Volatile var isMirroring = false
+        private set
+
+    /** Aspect-ratio listener installed by MirrorActivity while it is up. */
+    @Volatile var aspectListener: ((Int, Int) -> Unit)? = null
+
+    // Owned by the service for the lifetime of the server — created before
+    // nativeStart so early audio_get_format / video frames are never dropped.
     var videoDecoder: VideoDecoder? = null
     var audioPipeline: AudioPipeline? = null
 
@@ -61,6 +67,10 @@ class AirPlayService : Service(), AirPlayNative.Listener {
 
     private fun startServer() {
         if (running) return
+        if (videoDecoder == null) {
+            videoDecoder = VideoDecoder { w, h -> aspectListener?.invoke(w, h) }
+        }
+        if (audioPipeline == null) audioPipeline = AudioPipeline()
         val name = deviceName()
         val keyfile = filesDir.resolve("airplay.pem").absolutePath
         val ok = AirPlayNative.nativeStart(name, Settings.hwAddr(this), keyfile, this)
@@ -149,18 +159,18 @@ class AirPlayService : Service(), AirPlayNative.Listener {
     override fun onConnectionOpen() {}
 
     override fun onConnectionClose() {
-        mirroring = false
+        isMirroring = false
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }
 
     override fun onConnectionReset(reason: Int) {
-        mirroring = false
+        isMirroring = false
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }
 
     override fun onMirrorStart() {
-        if (!mirroring) {
-            mirroring = true
+        if (!isMirroring) {
+            isMirroring = true
             bringActivityToFront()
         }
     }
@@ -176,7 +186,7 @@ class AirPlayService : Service(), AirPlayNative.Listener {
     override fun onVideoFlush() {}
 
     override fun onVideoReset(type: Int) {
-        mirroring = false
+        isMirroring = false
         videoDecoder?.reset()
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }

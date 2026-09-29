@@ -17,7 +17,7 @@ jobs:
       - name: Install NDK + CMake
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
+          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
       - name: Fetch and build native deps
         run: bash native/fetch-and-build-deps.sh
         env:

@@ -11,6 +11,8 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <atomic>
 #include <android/log.h>
 
 extern "C" {
@@ -33,11 +35,32 @@ JavaVM *g_vm = nullptr;
 jobject g_listener = nullptr;          // global ref to AirPlayNative.Listener
 raop_t *g_raop = nullptr;
 dnssd_t *g_dnssd = nullptr;
-bool g_running = false;
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-int g_open_connections = 0;
+std::atomic<bool> g_running{false};
+std::atomic<int> g_open_connections{0};
+std::atomic<bool> g_mirroring{false};
 double g_current_volume = -30.0;       // AirPlay dB range {-30:0}, -144 = mute
-bool g_mirroring = false;
+
+/* jmethodIDs resolved once in nativeStart. UxPlay's native threads stay
+ * attached to the JVM for the whole session, so local refs created per
+ * frame (classes, buffers, strings) would overflow the local ref table —
+ * nothing here may leak a local ref. */
+struct CbIds {
+    jmethodID onConnectionOpen = nullptr;
+    jmethodID onConnectionClose = nullptr;
+    jmethodID onConnectionReset = nullptr;
+    jmethodID onMirrorStart = nullptr;
+    jmethodID onVideoData = nullptr;
+    jmethodID onVideoFlush = nullptr;
+    jmethodID onVideoReset = nullptr;
+    jmethodID onVideoSize = nullptr;
+    jmethodID onAudioFormat = nullptr;
+    jmethodID onAudioData = nullptr;
+    jmethodID onAudioFlush = nullptr;
+    jmethodID onAudioVolume = nullptr;
+    jmethodID onClientRequest = nullptr;
+};
+CbIds g_ids;
 
 /* fixed legacy ports (upstream "-p" defaults): TCP 7100:7000:7001 UDP 7011:6001:6000 */
 unsigned short g_tcp[3] = {7100, 7000, 7001};
@@ -67,23 +90,21 @@ struct JniEnv {
 pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 void make_key() { pthread_key_create(&g_jni_key, jni_detach); }
 
-jmethodID mid(JNIEnv *env, const char *name, const char *sig) {
-    jclass cls = env->GetObjectClass(g_listener);
-    jmethodID m = env->GetMethodID(cls, name, sig);
-    if (!m) env->ExceptionClear();
-    return m;
+void check_exception(JNIEnv *env) {
+    if (env->ExceptionCheck()) env->ExceptionDescribe();
 }
 
-void call_void(const char *name, const char *sig, ...) {
+/* Call a void listener method with varargs (CallVoidMethodV: `ap` carries
+ * the actual arguments). */
+void call_void(jmethodID m, ...) {
+    if (!m) return;
     JniEnv e;
     if (!e.ok()) return;
-    jmethodID m = mid(e.env, name, sig);
-    if (!m) return;
     va_list ap;
-    va_start(ap, sig);
-    e.env->CallVoidMethod(g_listener, m, ap);
+    va_start(ap, m);
+    e.env->CallVoidMethodV(g_listener, m, ap);
     va_end(ap);
-    if (e.env->ExceptionCheck()) e.env->ExceptionDescribe();
+    check_exception(e.env);
 }
 
 /* ---------- upstream-style callbacks ---------- */
@@ -101,19 +122,19 @@ void jni_log_callback(void *cls, int level, const char *msg) {
 }
 
 void cb_conn_init(void *cls) {
-    g_open_connections++;
-    ALOGD("Open connections: %d", g_open_connections);
-    call_void("onConnectionOpen", "()V");
+    int n = ++g_open_connections;
+    ALOGD("Open connections: %d", n);
+    call_void(g_ids.onConnectionOpen);
 }
 
 void cb_conn_destroy(void *cls) {
-    g_open_connections--;
-    ALOGD("Open connections: %d", g_open_connections);
-    if (g_open_connections <= 0) {
+    int n = --g_open_connections;
+    ALOGD("Open connections: %d", n);
+    if (n <= 0) {
         g_open_connections = 0;
         g_mirroring = false;
     }
-    call_void("onConnectionClose", "()V");
+    call_void(g_ids.onConnectionClose);
 }
 
 void cb_conn_feedback(void *cls) { /* heartbeat: connection still alive */ }
@@ -121,40 +142,37 @@ void cb_conn_feedback(void *cls) { /* heartbeat: connection still alive */ }
 void cb_conn_reset(void *cls, int reason) {
     if (reason == 1) ALOGE("lost connection with client (network problem?)");
     g_mirroring = false;
-    call_void("onConnectionReset", "(I)V", reason);
+    call_void(g_ids.onConnectionReset, (jint) reason);
 }
 
 void cb_video_process(void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
     /* Annex-B H.264, SPS/PPS prepended before IDRs. No clock sync: we hand the
      * access unit straight to MediaCodec for lowest-latency rendering. */
-    if (!g_mirroring) {
-        g_mirroring = true;
-        call_void("onMirrorStart", "()V");
+    if (!g_mirroring.exchange(true)) {
+        call_void(g_ids.onMirrorStart);
     }
+    if (!g_ids.onVideoData) return;
     JniEnv e;
     if (!e.ok()) return;
-    jmethodID m = mid(e.env, "onVideoData", "(Ljava/nio/ByteBuffer;II)V");
-    if (!m) return;
     jobject buf = e.env->NewDirectByteBuffer(data->data, data->data_len);
     if (!buf) { e.env->ExceptionClear(); return; }
-    e.env->CallVoidMethod(g_listener, m, buf, data->data_len,
-                          static_cast<jint>(data->nal_count));
+    e.env->CallVoidMethod(g_listener, g_ids.onVideoData, buf,
+                          (jint) data->data_len, (jint) data->nal_count);
     e.env->DeleteLocalRef(buf);
-    if (e.env->ExceptionCheck()) e.env->ExceptionDescribe();
+    check_exception(e.env);
 }
 
 void cb_audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+    if (!g_ids.onAudioData) return;
     JniEnv e;
     if (!e.ok()) return;
-    jmethodID m = mid(e.env, "onAudioData", "(Ljava/nio/ByteBuffer;III)V");
-    if (!m) return;
     jobject buf = e.env->NewDirectByteBuffer(data->data, data->data_len);
     if (!buf) { e.env->ExceptionClear(); return; }
-    e.env->CallVoidMethod(g_listener, m, buf, data->data_len,
-                          static_cast<jint>(data->ct),
-                          static_cast<jint>(data->seqnum));
+    e.env->CallVoidMethod(g_listener, g_ids.onAudioData, buf,
+                          (jint) data->data_len, (jint) data->ct,
+                          (jint) data->seqnum);
     e.env->DeleteLocalRef(buf);
-    if (e.env->ExceptionCheck()) e.env->ExceptionDescribe();
+    check_exception(e.env);
 }
 
 void cb_video_pause(void *cls) {}
@@ -163,7 +181,7 @@ void cb_video_resume(void *cls) {}
 void cb_video_reset(void *cls, reset_type_t type) {
     ALOGD("video_reset: type = %d", (int) type);
     g_mirroring = false;
-    call_void("onVideoReset", "(I)V", (int) type);
+    call_void(g_ids.onVideoReset, (jint) type);
 }
 
 int cb_video_set_codec(void *cls, video_codec_t codec) {
@@ -174,43 +192,39 @@ int cb_video_set_codec(void *cls, video_codec_t codec) {
 
 void cb_video_report_size(void *cls, float *width_source, float *height_source,
                           float *width, float *height) {
-    JniEnv e;
-    if (!e.ok()) return;
-    jmethodID m = mid(e.env, "onVideoSize", "(FFFF)V");
-    if (!m) return;
-    e.env->CallVoidMethod(g_listener, m, *width_source, *height_source, *width, *height);
-    if (e.env->ExceptionCheck()) e.env->ExceptionDescribe();
+    call_void(g_ids.onVideoSize, (jfloat) *width_source, (jfloat) *height_source,
+              (jfloat) *width, (jfloat) *height);
 }
 
-void cb_audio_flush(void *cls) { call_void("onAudioFlush", "()V"); }
-void cb_video_flush(void *cls) { call_void("onVideoFlush", "()V"); }
+void cb_audio_flush(void *cls) { call_void(g_ids.onAudioFlush); }
+void cb_video_flush(void *cls) { call_void(g_ids.onVideoFlush); }
 
 double cb_audio_set_client_volume(void *cls) { return g_current_volume; }
 
 void cb_audio_set_volume(void *cls, float volume) {
     g_current_volume = volume;
-    call_void("onAudioVolume", "(F)V", volume);
+    call_void(g_ids.onAudioVolume, (jfloat) volume);
 }
 
 void cb_audio_get_format(void *cls, unsigned char *ct, unsigned short *spf,
                          bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     ALOGI("audio_get_format ct=%d spf=%d usingScreen=%d isMedia=%d audioFormat=0x%lx",
           *ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
-    call_void("onAudioFormat", "(II)V", (jint) *ct, (jint) *spf);
+    call_void(g_ids.onAudioFormat, (jint) *ct, (jint) *spf);
 }
 
 void cb_report_client_request(void *cls, char *deviceid, char *model, char *name,
                               bool *admit) {
     ALOGI("connection request from %s (%s) deviceID=%s", name, model, deviceid);
     *admit = true;
+    if (!g_ids.onClientRequest) return;
     JniEnv e;
     if (!e.ok()) return;
-    jmethodID m = mid(e.env, "onClientRequest", "(Ljava/lang/String;)V");
-    if (!m) return;
     jstring jname = e.env->NewStringUTF(name ? name : "?");
-    e.env->CallVoidMethod(g_listener, m, jname);
+    if (!jname) { e.env->ExceptionClear(); return; }
+    e.env->CallVoidMethod(g_listener, g_ids.onClientRequest, jname);
     e.env->DeleteLocalRef(jname);
-    if (e.env->ExceptionCheck()) e.env->ExceptionDescribe();
+    check_exception(e.env);
 }
 
 void cb_display_pin(void *cls, char *pin) { ALOGI("client PIN = %s", pin); }
@@ -305,6 +319,27 @@ Java_dev_voftec_airplaytv_AirPlayNative_nativeStart(
     env->GetJavaVM(&g_vm);
     if (g_listener) env->DeleteGlobalRef(g_listener);
     g_listener = env->NewGlobalRef(listener);
+
+    /* resolve all method IDs once; no local refs are created per frame */
+    memset(&g_ids, 0, sizeof(g_ids));
+    {
+        jclass cls = env->GetObjectClass(g_listener);
+        g_ids.onConnectionOpen = env->GetMethodID(cls, "onConnectionOpen", "()V");
+        g_ids.onConnectionClose = env->GetMethodID(cls, "onConnectionClose", "()V");
+        g_ids.onConnectionReset = env->GetMethodID(cls, "onConnectionReset", "(I)V");
+        g_ids.onMirrorStart = env->GetMethodID(cls, "onMirrorStart", "()V");
+        g_ids.onVideoData = env->GetMethodID(cls, "onVideoData", "(Ljava/nio/ByteBuffer;II)V");
+        g_ids.onVideoFlush = env->GetMethodID(cls, "onVideoFlush", "()V");
+        g_ids.onVideoReset = env->GetMethodID(cls, "onVideoReset", "(I)V");
+        g_ids.onVideoSize = env->GetMethodID(cls, "onVideoSize", "(FFFF)V");
+        g_ids.onAudioFormat = env->GetMethodID(cls, "onAudioFormat", "(II)V");
+        g_ids.onAudioData = env->GetMethodID(cls, "onAudioData", "(Ljava/nio/ByteBuffer;III)V");
+        g_ids.onAudioFlush = env->GetMethodID(cls, "onAudioFlush", "()V");
+        g_ids.onAudioVolume = env->GetMethodID(cls, "onAudioVolume", "(F)V");
+        g_ids.onClientRequest = env->GetMethodID(cls, "onClientRequest", "(Ljava/lang/String;)V");
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
 
     const char *name = env->GetStringUTFChars(jname, nullptr);
     const char *keyfile = env->GetStringUTFChars(jkeyfile, nullptr);
@@ -436,6 +471,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_dev_voftec_airplaytv_AirPlayNative_nativeStop(JNIEnv *env, jclass clazz) {
     pthread_mutex_lock(&g_lock);
     g_running = false;
+    g_mirroring = false;
+    g_open_connections = 0;
+    /* upstream order: stop the raop server (raop_destroy) first so no
+     * callback can still be in flight, then tear down dnssd, and only
+     * then release the listener. */
     if (g_raop) { raop_destroy(g_raop); g_raop = nullptr; }
     if (g_dnssd) {
         dnssd_unregister_raop(g_dnssd);
@@ -449,5 +489,5 @@ Java_dev_voftec_airplaytv_AirPlayNative_nativeStop(JNIEnv *env, jclass clazz) {
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_dev_voftec_airplaytv_AirPlayNative_nativeIsRunning(JNIEnv *env, jclass clazz) {
-    return g_running ? JNI_TRUE : JNI_FALSE;
+    return g_running.load() ? JNI_TRUE : JNI_FALSE;
 }

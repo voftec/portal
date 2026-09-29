@@ -3,110 +3,277 @@ package dev.voftec.airplaytv
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
- * Low-latency H.264 decoder feeding a Surface. Annex-B input, buffers queue
- * straight into MediaCodec; every output frame is rendered immediately
- * (releaseOutputBuffer render=true, no clock sync).
+ * Low-latency H.264 decoder feeding a Surface, MediaCodec async mode on a
+ * dedicated HandlerThread. Annex-B access units are copied into a bounded
+ * queue on the native callback thread (never blocks); onInputBufferAvailable
+ * drains the queue, onOutputBufferAvailable renders immediately — including
+ * when the Mac desktop is static and no new input arrives.
  *
- * Before the surface exists, access units are buffered from the latest IDR
- * onward (bounded) and flushed into the codec once the surface is ready —
- * macOS doesn't resend IDRs often, so without this the first seconds are lost.
+ * If the queue exceeds MAX_QUEUED_AUS, everything before the latest IDR is
+ * dropped to bound latency. Before the surface exists, AUs are buffered from
+ * the latest IDR onward (cap PENDING_CAP) and flushed once the codec is up —
+ * macOS doesn't resend IDRs often, so the first seconds would otherwise be lost.
  */
 class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
 
     companion object {
         private const val TAG = "AirPlayTV.Video"
-        private const val MAX_PENDING_BYTES = 16 * 1024 * 1024
+        private const val PENDING_CAP = 16 * 1024 * 1024
+        private const val MAX_QUEUED_AUS = 30
     }
+
+    private val lock = ReentrantLock()
 
     private var codec: MediaCodec? = null
     private var surface: Surface? = null
     private var configuredWidth = 0
     private var configuredHeight = 0
 
-    // Pending access units captured before the surface/codec is ready.
+    private var codecThread: HandlerThread? = null
+    private var codecHandler: Handler? = null
+
+    // AUs queued for an idle input buffer (codec running, no free slot yet).
+    private val queue = ArrayDeque<ByteArray>()
+    @Volatile private var freeInput = -1   // free input index while queue empty
+
+    // AUs captured before the surface/codec exists.
     private val pending = ArrayList<ByteArray>()
     private var pendingBytes = 0
-    private var pendingHasIdr = false
 
     @Volatile var reportedWidth = 0
     @Volatile var reportedHeight = 0
 
-    @Synchronized
-    fun setSurface(s: Surface?) {
-        surface = s
-        if (s == null) {
-            releaseCodec()
-        } else {
-            flushPendingIntoCodec()
+    private val codecCallback = object : MediaCodec.Callback() {
+        override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
+            val au = lock.withLock { if (queue.isNotEmpty()) queue.poll() else null }
+            if (au != null) {
+                submit(c, index, au)
+                // one buffer used; more may be queued — they arrive via further
+                // onInputBufferAvailable calls
+            } else {
+                lock.withLock { freeInput = index }
+            }
+        }
+
+        override fun onOutputBufferAvailable(c: MediaCodec, index: Int,
+                                             info: MediaCodec.BufferInfo) {
+            val render = info.size > 0 &&
+                (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+            try {
+                c.releaseOutputBuffer(index, render)
+            } catch (e: Exception) {
+                Log.w(TAG, "releaseOutputBuffer: $e")
+            }
+        }
+
+        override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+            Log.e(TAG, "codec error: ${e.diagnosticInfo}")
+        }
+
+        override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {
+            val w = format.getInteger(MediaFormat.KEY_WIDTH)
+            val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+            lock.withLock {
+                configuredWidth = w
+                configuredHeight = h
+            }
+            onAspectRatio(w, h)
         }
     }
 
-    @Synchronized
+    fun setSurface(s: Surface?) {
+        lock.withLock {
+            surface = s
+        }
+        if (s == null) {
+            stopCodec()
+        } else {
+            startCodecIfNeeded(null)
+            drainPending()
+        }
+    }
+
     fun onReportedSize(width: Int, height: Int) {
         reportedWidth = width
         reportedHeight = height
     }
 
-    @Synchronized
+    /** Called from the native video thread. `data` is only valid during the call. */
     fun feed(data: ByteBuffer, len: Int) {
         val bytes = ByteArray(len)
         data.get(bytes, 0, len)
 
-        if (surface == null || codec == null) {
-            val idr = findIdr(bytes)
-            if (idr >= 0 || pendingHasIdr || pending.isEmpty()) {
-                if (idr >= 0) {
-                    // keep from SPS/PPS onward: drop nothing before first VCL —
-                    // upstream already prepends SPS/PPS before each IDR.
+        val hasIdr = findIdr(bytes) >= 0
+        lock.withLock {
+            if (surface == null || codec == null) {
+                // pre-surface: buffer from latest IDR onward, bounded
+                if (hasIdr) {
                     pending.clear()
                     pendingBytes = 0
-                    pendingHasIdr = true
-                }
-                if (pendingBytes + bytes.size <= MAX_PENDING_BYTES) {
+                    pending.add(bytes)
+                    pendingBytes = bytes.size
+                } else if (pendingBytes + bytes.size <= PENDING_CAP &&
+                           (pending.isNotEmpty() || bytes.size > 0)) {
                     pending.add(bytes)
                     pendingBytes += bytes.size
                 }
+                return
             }
-            return
+            queue.add(bytes)
+            while (queue.size > MAX_QUEUED_AUS) {
+                dropBeforeLatestIdr()
+            }
         }
-
-        maybeReconfigure(bytes)
-        queueToCodec(bytes)
+        offerToCodec()
     }
 
-    @Synchronized
     fun reset() {
-        pending.clear()
-        pendingBytes = 0
-        pendingHasIdr = false
-        releaseCodec()
-        if (surface != null) flushPendingIntoCodec()
-    }
-
-    @Synchronized
-    fun release() {
-        pending.clear()
-        pendingBytes = 0
-        pendingHasIdr = false
-        releaseCodec()
-        surface = null
-    }
-
-    private fun releaseCodec() {
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "codec release: $e")
+        stopCodec()
+        lock.withLock {
+            queue.clear()
+            pending.clear()
+            pendingBytes = 0
+            freeInput = -1
         }
-        codec = null
-        configuredWidth = 0
-        configuredHeight = 0
+        if (surface != null) startCodecIfNeeded(null)
+    }
+
+    fun release() {
+        stopCodec()
+        lock.withLock {
+            queue.clear()
+            pending.clear()
+            pendingBytes = 0
+            surface = null
+            freeInput = -1
+        }
+    }
+
+    private fun submit(c: MediaCodec, index: Int, au: ByteArray) {
+        try {
+            val buf = c.getInputBuffer(index)
+            if (buf != null && buf.capacity() >= au.size) {
+                buf.clear()
+                buf.put(au)
+                c.queueInputBuffer(index, 0, au.size, 0, 0)
+            } else {
+                c.queueInputBuffer(index, 0, 0, 0, 0)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "queueInputBuffer: $e")
+        }
+    }
+
+    /** If a free input slot is remembered, push the head of the queue into it. */
+    private fun offerToCodec() {
+        val c = lock.withLock { codec } ?: return
+        lock.withLock {
+            if (freeInput < 0 || queue.isEmpty()) return
+        }
+        codecHandler?.post {
+            lock.withLock {
+                val idx = freeInput
+                if (idx >= 0 && queue.isNotEmpty()) {
+                    freeInput = -1
+                    submit(c, idx, queue.poll()!!)
+                }
+            }
+        }
+    }
+
+    private fun dropBeforeLatestIdr() {
+        // find index of the last IDR in the queue and drop everything before it
+        var lastIdr = -1
+        var i = 0
+        for (au in queue) {
+            if (findIdr(au) >= 0) lastIdr = i
+            i++
+        }
+        if (lastIdr > 0) repeat(lastIdr) { queue.poll() }
+        else queue.poll()
+    }
+
+    private fun drainPending() {
+        val toSend: List<ByteArray>
+        lock.withLock {
+            toSend = ArrayList(pending)
+            pending.clear()
+            pendingBytes = 0
+        }
+        lock.withLock { queue.addAll(toSend) }
+        offerToCodec()
+    }
+
+    private fun startCodecIfNeeded(firstAu: ByteArray?) {
+        val surf = lock.withLock { surface } ?: return
+        val w = if (reportedWidth > 0) reportedWidth else 1920
+        val h = if (reportedHeight > 0) reportedHeight else 1080
+        var vw = w; var vh = h
+        val probe = firstAu ?: lock.withLock { pending.firstOrNull() ?: queue.peek() }
+        if (probe != null) {
+            extractSps(probe)?.let { SpsParser.parseSize(it) }?.let {
+                vw = it.first; vh = it.second
+            }
+        }
+        lock.withLock {
+            if (codec != null && vw == configuredWidth && vh == configuredHeight) return
+        }
+        stopCodec()
+
+        codecThread = HandlerThread("airplay-video-codec").apply { start() }
+        codecHandler = Handler(codecThread!!.looper)
+
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, vw, vh)
+        if (Build.VERSION.SDK_INT >= 30) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+        try {
+            val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c.setCallback(codecCallback, codecHandler)
+            c.configure(format, surf, null, 0)
+            c.start()
+            lock.withLock {
+                codec = c
+                configuredWidth = vw
+                configuredHeight = vh
+            }
+            Log.i(TAG, "decoder configured ${vw}x$vh low-latency (async)")
+            onAspectRatio(vw, vh)
+        } catch (e: Exception) {
+            Log.e(TAG, "decoder configure failed: $e")
+            codecHandler?.looper?.quitSafely()
+            codecThread = null
+            codecHandler = null
+        }
+    }
+
+    private fun stopCodec() {
+        val c = lock.withLock { codec } ?: return
+        lock.withLock {
+            codec = null
+            configuredWidth = 0
+            configuredHeight = 0
+            freeInput = -1
+        }
+        codecHandler?.post {
+            try { c.stop(); c.release() } catch (e: Exception) {
+                Log.w(TAG, "codec stop/release: $e")
+            }
+            codecHandler?.looper?.quitSafely()
+        }
+        codecThread = null
+        codecHandler = null
     }
 
     /** Index of the first VCL IDR NAL (type 5) in an Annex-B stream, or -1. */
@@ -115,22 +282,19 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         while (i + 4 < data.size) {
             if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
                 data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
-                val nalType = data[i + 4].toInt() and 0x1f
-                if (nalType == 5) return i
+                if (data[i + 4].toInt() and 0x1f == 5) return i
             }
             i++
         }
         return -1
     }
 
-    /** Extract the first SPS to learn the coded size. */
     private fun extractSps(data: ByteArray): ByteArray? {
         var i = 0
         while (i + 5 < data.size) {
             if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
                 data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
-                val nalType = data[i + 4].toInt() and 0x1f
-                if (nalType == 7) {
+                if (data[i + 4].toInt() and 0x1f == 7) {
                     var end = i + 4
                     while (end + 3 < data.size &&
                         !(data[end] == 0.toByte() && data[end + 1] == 0.toByte() &&
@@ -144,109 +308,11 @@ class VideoDecoder(private val onAspectRatio: (Int, Int) -> Unit) {
         }
         return null
     }
-
-    private fun maybeReconfigure(firstAu: ByteArray) {
-        val sps = extractSps(firstAu)
-        var w = if (reportedWidth > 0) reportedWidth else 1920
-        var h = if (reportedHeight > 0) reportedHeight else 1080
-        if (sps != null) {
-            val parsed = SpsParser.parseSize(sps)
-            if (parsed != null) { w = parsed.first; h = parsed.second }
-        }
-        if (codec != null && w == configuredWidth && h == configuredHeight) return
-
-        releaseCodec()
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
-        if (Build.VERSION.SDK_INT >= 30) {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-        }
-        format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-        try {
-            codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-                configure(format, surface, null, 0)
-                start()
-            }
-            configuredWidth = w
-            configuredHeight = h
-            Log.i(TAG, "decoder configured ${w}x$h low-latency")
-            onAspectRatio(w, h)
-            drainOutput()
-        } catch (e: Exception) {
-            Log.e(TAG, "decoder configure failed: $e")
-            codec = null
-        }
-    }
-
-    private fun flushPendingIntoCodec() {
-        val surf = surface ?: return
-        if (pending.isEmpty()) return
-        val first = pending.first()
-        maybeReconfigure(first)
-        val c = codec ?: return
-        for (au in pending) queueToCodec(au)
-        pending.clear()
-        pendingBytes = 0
-        pendingHasIdr = false
-        drainOutput()
-    }
-
-    private fun queueToCodec(bytes: ByteArray) {
-        val c = codec ?: return
-        try {
-            val idx = c.dequeueInputBuffer(20_000)
-            if (idx >= 0) {
-                val buf = c.getInputBuffer(idx) ?: return
-                buf.clear()
-                if (buf.capacity() >= bytes.size) {
-                    buf.put(bytes)
-                    c.queueInputBuffer(idx, 0, bytes.size, 0, 0)
-                } else {
-                    Log.w(TAG, "input buffer too small (${buf.capacity()} < ${bytes.size})")
-                    c.queueInputBuffer(idx, 0, 0, 0, 0)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "queueInputBuffer: $e")
-        }
-        drainOutput()
-    }
-
-    private fun drainOutput() {
-        val c = codec ?: return
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            try {
-                val out = c.dequeueOutputBuffer(info, 0)
-                if (out < 0) break
-                if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 ||
-                    info.size == 0) {
-                    c.releaseOutputBuffer(out, false)
-                    continue
-                }
-                c.releaseOutputBuffer(out, true)
-            } catch (e: Exception) {
-                Log.w(TAG, "drainOutput: $e")
-                break
-            }
-        }
-        // format change (e.g. mid-session resolution switch in extended mode)
-        try {
-            val f = c.outputFormat
-            val w = f.getInteger(MediaFormat.KEY_WIDTH)
-            val h = f.getInteger(MediaFormat.KEY_HEIGHT)
-            if (w != configuredWidth || h != configuredHeight) {
-                configuredWidth = w
-                configuredHeight = h
-                onAspectRatio(w, h)
-            }
-        } catch (_: Exception) {}
-    }
 }
 
 /** Minimal SPS parser: enough to read pic_width/pic_height in MBs. */
 object SpsParser {
     fun parseSize(spsAnnexB: ByteArray): Pair<Int, Int>? {
-        // strip start code
         var start = 0
         if (spsAnnexB.size > 4 && spsAnnexB[0] == 0.toByte() && spsAnnexB[1] == 0.toByte() &&
             spsAnnexB[2] == 0.toByte() && spsAnnexB[3] == 1.toByte()) start = 4
@@ -254,7 +320,6 @@ object SpsParser {
             spsAnnexB[2] == 1.toByte()) start = 3
         if (start == 0 || spsAnnexB.size <= start) return null
 
-        // unescape emulation-prevention bytes
         val rbsp = ArrayList<Byte>(spsAnnexB.size)
         var zeros = 0
         for (i in start + 1 until spsAnnexB.size) { // skip nal header byte
@@ -263,8 +328,7 @@ object SpsParser {
             zeros = if (b == 0.toByte()) zeros + 1 else 0
             rbsp.add(b)
         }
-        val r = rbsp.toByteArray()
-        val bits = BitReader(r)
+        val bits = BitReader(rbsp.toByteArray())
         try {
             val profileIdc = bits.u(8)
             bits.u(8); bits.u(8)
@@ -306,8 +370,7 @@ object SpsParser {
 
     private fun skipScalingList(bits: BitReader) {
         var lastScale = 8; var nextScale = 8
-        val size = if (true) 16 else 64
-        repeat(size) {
+        repeat(16) {
             if (nextScale != 0) {
                 val delta = bits.se()
                 nextScale = (lastScale + delta + 256) % 256

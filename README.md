@@ -15,40 +15,57 @@ y el video/audio se decodifica con MediaCodec/AudioTrack de Android.
 - Una Mac en **la misma red Wi-Fi** (no la red de invitados; idealmente 5 GHz).
 - `adb` en la Mac (`brew install android-platform-tools`).
 
-## Paso 1: habilitar opciones de desarrollador en el Chromecast
+## Instalación (sin compilar)
 
-1. En la TV: **Configuración → Sistema → Información**.
-2. Bajá hasta **"Compilación del SO de Android TV"** y apretá **OK 7 veces**
-   con el control. Aparece "Ahora sos desarrollador".
-3. Volvé a **Configuración → Sistema → Opciones para desarrolladores** y
-   activá **Depuración USB** (habilita adb por red en el puerto 5555).
+### En el Chromecast con Google TV
 
-## Paso 2: encontrar la IP de la TV
+1. **Ajustes → Sistema → Acerca de** y tocá **«Compilación del SO de Android TV»**
+   **7 veces** con el control. Aparece "Ahora sos desarrollador".
+2. Volvé a **Ajustes → Sistema → Opciones para desarrolladores** y activá
+   **Depuración USB**.
+3. Anotá la IP en **Ajustes → Red e Internet → tu red Wi-Fi**
+   (algo como `192.168.x.x`).
 
-**Configuración → Red e Internet → (tu Wi-Fi)** muestra la IP. Suele ser algo
-como `192.168.x.x`.
-
-## Paso 3: instalar la app
+### En la Mac
 
 ```sh
-./gradlew assembleDebug        # compila el APK (ver "Compilar desde cero")
+brew install android-platform-tools
+# bajá pantalla-airplay.apk desde Releases del repo (va a ~/Downloads)
 ./scripts/install-tv.sh 192.168.x.x
 ```
 
-El script conecta por adb, instala el APK, habilita `SYSTEM_ALERT_WINDOW` (para
-que la app pueda mostrarse al frente cuando empieza la duplicación) y abre la app.
+O a mano:
 
-## Uso desde la Mac
+```sh
+adb connect 192.168.x.x:5555
+adb install -r ~/Downloads/pantalla-airplay.apk
+adb shell appops set dev.voftec.airplaytv SYSTEM_ALERT_WINDOW allow
+adb shell am start -n dev.voftec.airplaytv/.MirrorActivity
+```
 
-1. Abrí **Centro de control** (barra de menú) → **Duplicar pantalla**.
+Si la TV pide confirmación, aceptá **«¿Permitir depuración?»** marcando
+**«Permitir siempre»** y volvé a correr el script.
+
+### Uso desde la Mac
+
+1. **Centro de control** (barra de menú) → **Duplicar pantalla**.
 2. Elegí **«TV del cuarto»** (el nombre se puede cambiar en la app con el control).
-3. Elegí **Duplicar** o **Usar como pantalla separada**.
+3. **Duplicar** para espejo o **«Usar como pantalla separada»** para usarla de
+   segundo monitor.
 
 Cuando empieza la duplicación, la TV pasa automáticamente del cartel de espera a
 la pantalla espejo; cuando cortás, vuelve al cartel.
 
 El receptor arranca solo al encender el Chromecast y queda visible aunque estés
 en la pantalla principal de Google TV.
+
+## Si no aparece o no conecta
+
+- La Mac y el Chromecast tienen que estar en la **misma red Wi-Fi** — no en la
+  red de invitados, y sin aislamiento de clientes en el router/AP.
+- Abrí la app **una vez** después de instalarla (el servicio arranca con ella y
+  después queda solo).
+- Logs del receptor: `adb logcat -s AirPlayTV`.
 
 ## Consejos
 

@@ -52,15 +52,25 @@ class MirrorActivity : Activity() {
         buildUi()
         attachToService()
         ContextCompat.startForegroundService(this, Intent(this, AirPlayService::class.java))
+        syncState(intent)
     }
 
+    /** Pipelines live in the service; the activity only installs the
+     *  aspect-ratio listener. The surface is attached strictly from
+     *  SurfaceHolder.Callback. */
     private fun attachToService() {
         val svc = AirPlayService.instance ?: return
-        if (svc.videoDecoder == null) {
-            svc.videoDecoder = VideoDecoder { w, h -> runOnUiThread { onVideoSize(w, h) } }
+        svc.aspectListener = { w, h -> runOnUiThread { onVideoSize(w, h) } }
+    }
+
+    private fun syncState(intent: Intent?) {
+        val svc = AirPlayService.instance
+        if (intent?.action == AirPlayService.ACTION_MIRROR_START ||
+            svc?.isMirroring == true) {
+            showMirror()
+        } else {
+            showIdle()
         }
-        if (svc.audioPipeline == null) svc.audioPipeline = AudioPipeline()
-        svc.videoDecoder?.setSurface(surfaceView.holder.surface)
     }
 
     private fun buildUi() {
@@ -69,7 +79,9 @@ class MirrorActivity : Activity() {
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(object : SurfaceHolder.Callback {
                 override fun surfaceCreated(h: SurfaceHolder) {
-                    AirPlayService.instance?.videoDecoder?.setSurface(h.surface)
+                    if (h.surface.isValid) {
+                        AirPlayService.instance?.videoDecoder?.setSurface(h.surface)
+                    }
                 }
                 override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
                 override fun surfaceDestroyed(h: SurfaceHolder) {
@@ -154,6 +166,11 @@ class MirrorActivity : Activity() {
         refreshStatus()
     }
 
+    override fun onDestroy() {
+        AirPlayService.instance?.aspectListener = null
+        super.onDestroy()
+    }
+
     private fun onVideoSize(w: Int, h: Int) {
         videoWidth = w
         videoHeight = h
@@ -223,7 +240,7 @@ class MirrorActivity : Activity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.action == AirPlayService.ACTION_MIRROR_START) showMirror()
+        syncState(intent)
     }
 
     override fun onResume() {
@@ -231,6 +248,7 @@ class MirrorActivity : Activity() {
         hideSystemUi()
         attachToService()
         refreshStatus()
+        syncState(null)
         val filter = IntentFilter().apply {
             addAction(AirPlayService.ACTION_MIRROR_START)
             addAction(AirPlayService.ACTION_MIRROR_STOP)
