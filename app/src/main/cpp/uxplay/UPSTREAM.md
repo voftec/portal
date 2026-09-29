@@ -13,4 +13,4 @@ backend, same as upstream's `USE_MDNS` build), `renderers/` and `uxplay.cpp`
 
 Keep this list current; patches must stay minimal.
 
-1. `lib/mdnsd/mdnsd.c`: (TBD — none yet)
+None — the vendored tree builds unmodified.

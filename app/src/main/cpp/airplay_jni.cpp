@@ -399,7 +399,7 @@ Java_dev_voftec_airplaytv_AirPlayNative_nativeStart(
     raop_set_udp_ports(g_raop, g_udp);   // {timing=7011, control=6001, data=6000}
 
     raop_port = raop_get_port(g_raop);
-    if (raop_start_httpd(g_raop, &raop_port)) {
+    if (raop_start_httpd(g_raop, &raop_port) < 0) {  // returns 1 on success
         ALOGE("raop_start_httpd failed");
         goto fail;
     }

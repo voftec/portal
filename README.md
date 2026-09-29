@@ -1,4 +1,4 @@
-# Pantalla AirPlay
+# Portal — Pantalla AirPlay
 
 Convertí tu **Chromecast con Google TV** en un receptor AirPlay nativo: tu Mac lo
 detecta como pantalla inalámbrica desde **Centro de control → Duplicar pantalla**,
