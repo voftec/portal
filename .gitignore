@@ -14,5 +14,6 @@ native/deps/
 native/prebuilt/
 
 # keystores
+keystore.properties
 *.keystore
 *.jks

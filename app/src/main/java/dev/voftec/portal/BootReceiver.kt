@@ -1,4 +1,4 @@
-package dev.voftec.airplaytv
+package dev.voftec.portal
 
 import android.content.BroadcastReceiver
 import android.content.Context

@@ -1,11 +1,11 @@
-# Portal — Pantalla AirPlay
+# Portal — Pantalla para Mac
 
-Convertí tu **Chromecast con Google TV** en un receptor AirPlay nativo: tu Mac lo
+Convertí tu **Chromecast con Google TV** en un receptor compatible con AirPlay: tu Mac lo
 detecta como pantalla inalámbrica desde **Centro de control → Duplicar pantalla**,
 sin instalar ninguna app en la Mac. Podés usarlo como **espejo** o como
 **pantalla separada** (segundo monitor).
 
-Es una app para Android TV que corre un servidor AirPlay en el Chromecast: la
+Es una app para Android TV compatible con AirPlay que corre en el Chromecast: la
 parte de red y protocolo es un port del servidor C de [UxPlay](https://github.com/FDH2/UxPlay)
 y el video/audio se decodifica con MediaCodec/AudioTrack de Android.
 
@@ -30,7 +30,7 @@ y el video/audio se decodifica con MediaCodec/AudioTrack de Android.
 
 ```sh
 brew install android-platform-tools
-# bajá pantalla-airplay.apk desde Releases del repo (va a ~/Downloads)
+# bajá portal.apk desde Releases del repo (va a ~/Downloads)
 ./scripts/install-tv.sh 192.168.x.x
 ```
 
@@ -38,9 +38,8 @@ O a mano:
 
 ```sh
 adb connect 192.168.x.x:5555
-adb install -r ~/Downloads/pantalla-airplay.apk
-adb shell appops set dev.voftec.airplaytv SYSTEM_ALERT_WINDOW allow
-adb shell am start -n dev.voftec.airplaytv/.MirrorActivity
+adb install -r ~/Downloads/portal.apk
+adb shell am start -n dev.voftec.portal/.MirrorActivity
 ```
 
 Si la TV pide confirmación, aceptá **«¿Permitir depuración?»** marcando
@@ -55,6 +54,11 @@ Si la TV pide confirmación, aceptá **«¿Permitir depuración?»** marcando
 
 Cuando empieza la duplicación, la TV pasa automáticamente del cartel de espera a
 la pantalla espejo; cuando cortás, vuelve al cartel.
+
+Si Portal está en segundo plano, intenta abrir la pantalla espejo. Android TV
+puede bloquear esa apertura: tocá la notificación de Portal para verla, o abrí
+la app desde el launcher. Permití las notificaciones cuando Android lo solicite;
+si están desactivadas, abrí Portal manualmente antes de duplicar.
 
 El receptor arranca solo al encender el Chromecast y queda visible aunque estés
 en la pantalla principal de Google TV.
@@ -80,17 +84,44 @@ en la pantalla principal de Google TV.
 
 ## Compilar desde cero
 
-Necesitás JDK 17, Android SDK (platform 34, build-tools 34, NDK 26.3, CMake 3.22).
+Necesitás JDK 17, Android SDK (platform 34, build-tools 34, NDK 27.0.12077973, CMake 3.22.1).
 
 ```sh
 ./native/fetch-and-build-deps.sh   # baja y compila OpenSSL 3.0.22 + libplist 2.7.0
 ./gradlew assembleDebug            # APK en app/build/outputs/apk/debug/
+./gradlew assembleRelease bundleRelease
 ```
 
 Gradle ejecuta `fetch-and-build-deps.sh` automáticamente si faltan los artefactos,
 así que alcanza con `./gradlew assembleDebug` desde un checkout limpio. Las
 versiones de las dependencias nativas están clavadas con sha256 en
 `native/fetch-and-build-deps.sh` y `native/build-openssl.sh`.
+
+### Releases: venta directa y Google Play
+
+El APK queda en `app/build/outputs/apk/release/` y el AAB para Play en
+`app/build/outputs/bundle/release/`. Renombrá el APK firmado a `portal.apk`
+para distribuirlo directamente. El APK y el AAB se generan sin firma si no
+están configurados los cuatro valores siguientes:
+
+| Variable de entorno | Clave en `keystore.properties` |
+| --- | --- |
+| `RELEASE_STORE_FILE` | `storeFile` |
+| `RELEASE_STORE_PASSWORD` | `storePassword` |
+| `RELEASE_KEY_ALIAS` | `keyAlias` |
+| `RELEASE_KEY_PASSWORD` | `keyPassword` |
+
+Las variables tienen prioridad. El archivo opcional `keystore.properties` va
+en la raíz; `storeFile` es una ruta absoluta o relativa a esa raíz (en Windows,
+usá barras `/`). No subas claves ni contraseñas al repo: el archivo y los
+keystores están ignorados. Conservá tu clave para futuras actualizaciones.
+Para Play, usá la clave de carga de Play App Signing.
+
+CI mantiene debug y lint y publica también APK y AAB release. Para firmarlos,
+configurá los secrets `RELEASE_KEYSTORE_BASE64` (contenido del keystore en
+base64), `RELEASE_STORE_PASSWORD`, `RELEASE_KEY_ALIAS` y
+`RELEASE_KEY_PASSWORD`. Si falta alguno, CI genera artefactos sin firma
+(no instalables/publicables hasta firmarlos).
 
 ## Créditos
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Instala Pantalla AirPlay en un Chromecast con Google TV por red (adb).
+# Instala Portal en un Chromecast con Google TV por red (adb).
 # Uso: ./scripts/install-tv.sh <IP_DE_LA_TV> [ruta/al.apk]
 set -euo pipefail
 
@@ -22,11 +22,11 @@ if [ -n "${2:-}" ]; then
     APK="$2"
 elif [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
     APK="app/build/outputs/apk/debug/app-debug.apk"
-elif [ -f "$HOME/Downloads/pantalla-airplay.apk" ]; then
-    APK="$HOME/Downloads/pantalla-airplay.apk"
+elif [ -f "$HOME/Downloads/portal.apk" ]; then
+    APK="$HOME/Downloads/portal.apk"
 else
     echo "No se encontró el APK. Pasalo como segundo argumento o bajalo" >&2
-    echo "a ~/Downloads/pantalla-airplay.apk desde Releases del repo." >&2
+    echo "a ~/Downloads/portal.apk desde Releases del repo." >&2
     exit 1
 fi
 echo ">> APK: $APK"
@@ -49,10 +49,7 @@ fi
 echo ">> Instalando $APK"
 "$ADB" -s "$IP:5555" install -r "$APK"
 
-echo ">> Habilitando SYSTEM_ALERT_WINDOW (para traer la app al frente)"
-"$ADB" -s "$IP:5555" shell appops set dev.voftec.airplaytv SYSTEM_ALERT_WINDOW allow || true
-
 echo ">> Abriendo la app"
-"$ADB" -s "$IP:5555" shell am start -n dev.voftec.airplaytv/.MirrorActivity
+"$ADB" -s "$IP:5555" shell am start -n dev.voftec.portal/.MirrorActivity
 
 echo ">> Listo. En la Mac: Centro de control → Duplicar pantalla → «TV del cuarto»"

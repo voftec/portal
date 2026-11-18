@@ -22,9 +22,38 @@ jobs:
         run: bash native/fetch-and-build-deps.sh
         env:
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
-      - name: Build APK
-        run: ./gradlew assembleDebug lint
+      - name: Prepare optional release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$KEYSTORE_BASE64" && -n "$RELEASE_STORE_PASSWORD" && -n "$RELEASE_KEY_ALIAS" && -n "$RELEASE_KEY_PASSWORD" ]]; then
+            umask 077
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/portal-release.jks"
+            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/portal-release.jks" >> "$GITHUB_ENV"
+          fi
+      - name: Build debug and release APKs, Play bundle and lint
+        run: ./gradlew assembleDebug assembleRelease bundleRelease lint
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/portal-release.jks"
       - uses: actions/upload-artifact@v4
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-release-aab
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error

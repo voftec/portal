@@ -1,4 +1,4 @@
-package dev.voftec.airplaytv
+package dev.voftec.portal
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -22,9 +22,9 @@ class AirPlayService : Service(), AirPlayNative.Listener {
         private const val TAG = "AirPlayTV"
         private const val CHANNEL_ID = "airplay"
         private const val NOTIF_ID = 1
-        const val ACTION_MIRROR_START = "dev.voftec.airplaytv.MIRROR_START"
-        const val ACTION_MIRROR_STOP = "dev.voftec.airplaytv.MIRROR_STOP"
-        const val ACTION_STATUS = "dev.voftec.airplaytv.STATUS"
+        const val ACTION_MIRROR_START = "dev.voftec.portal.MIRROR_START"
+        const val ACTION_MIRROR_STOP = "dev.voftec.portal.MIRROR_STOP"
+        const val ACTION_STATUS = "dev.voftec.portal.STATUS"
 
         @Volatile var running = false
             private set
@@ -131,7 +131,8 @@ class AirPlayService : Service(), AirPlayNative.Listener {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text, deviceName()))
+            .setContentText(if (isMirroring) getString(R.string.mirror_notification_text)
+                else getString(R.string.notification_text, deviceName()))
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
@@ -148,10 +149,20 @@ class AirPlayService : Service(), AirPlayNative.Listener {
         try {
             startActivity(i)
         } catch (e: Exception) {
-            // SYSTEM_ALERT_WINDOW fallback path
             Log.w(TAG, "startActivity from service: $e")
         }
+        // Background launches can be silently blocked, so always offer a tap target.
+        updateNotification()
         sendBroadcast(Intent(ACTION_MIRROR_START).setPackage(packageName))
+    }
+
+    private fun updateNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            manager.notify(NOTIF_ID, buildNotification())
+        }
     }
 
     // ---- AirPlayNative.Listener (called from native threads) ----
@@ -160,11 +171,13 @@ class AirPlayService : Service(), AirPlayNative.Listener {
 
     override fun onConnectionClose() {
         isMirroring = false
+        updateNotification()
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }
 
     override fun onConnectionReset(reason: Int) {
         isMirroring = false
+        updateNotification()
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }
 
@@ -187,6 +200,7 @@ class AirPlayService : Service(), AirPlayNative.Listener {
 
     override fun onVideoReset(type: Int) {
         isMirroring = false
+        updateNotification()
         videoDecoder?.reset()
         sendBroadcast(Intent(ACTION_MIRROR_STOP).setPackage(packageName))
     }

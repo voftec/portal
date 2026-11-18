@@ -1,4 +1,4 @@
-package dev.voftec.airplaytv
+package dev.voftec.portal
 
 import android.media.AudioAttributes
 import android.media.AudioFormat

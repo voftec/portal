@@ -309,7 +309,7 @@ int apply_feature_bits(dnssd_t *dnssd) {
 } // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_dev_voftec_airplaytv_AirPlayNative_nativeStart(
+Java_dev_voftec_portal_AirPlayNative_nativeStart(
         JNIEnv *env, jclass clazz, jstring jname, jbyteArray jhwAddr,
         jstring jkeyfile, jobject listener) {
     pthread_mutex_lock(&g_lock);
@@ -468,7 +468,7 @@ fail:
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_dev_voftec_airplaytv_AirPlayNative_nativeStop(JNIEnv *env, jclass clazz) {
+Java_dev_voftec_portal_AirPlayNative_nativeStop(JNIEnv *env, jclass clazz) {
     pthread_mutex_lock(&g_lock);
     g_running = false;
     g_mirroring = false;
@@ -488,6 +488,6 @@ Java_dev_voftec_airplaytv_AirPlayNative_nativeStop(JNIEnv *env, jclass clazz) {
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_dev_voftec_airplaytv_AirPlayNative_nativeIsRunning(JNIEnv *env, jclass clazz) {
+Java_dev_voftec_portal_AirPlayNative_nativeIsRunning(JNIEnv *env, jclass clazz) {
     return g_running.load() ? JNI_TRUE : JNI_FALSE;
 }
